@@ -1,101 +1,163 @@
 use anchor_lang::prelude::*;
+use anchor_lang::solana_program;
 
-declare_id!("7vnf4qketJbYnbiEapQie7NjWqWtLocruCWX1TaUqe9x");
+declare_id!("9mpE1jK1k2V2X9KZW269pPE34j39wNwX3aQHejeHgKuQ");
 
 #[program]
-pub mod crowdfunding_program {
+pub mod solana_crowdfunding {
     use super::*;
 
-    pub fn create(ctx: Context<Create>, name: String, description: String, target_amount: u64) -> Result<()> {
-        let campaign = &mut ctx.accounts.campaign;
-        campaign.name = name;
-        campaign.description = description;
-        campaign.amount_donated = 0;
-        campaign.target_amount = target_amount;
-        // * - means dereferencing
-        campaign.owner = *ctx.accounts.user.key;
+    pub fn create(ctx: Context<Create>, goal: u64, deadline: u64, name: String) -> Result<()> {
+        let project = &mut ctx.accounts.project;
+
+        require!(goal > 0, ProjectErrors::GoalIsZero);
+        require!(
+            deadline > Clock::get()?.unix_timestamp.try_into().unwrap(),
+            ProjectErrors::DeadlineInThePast
+        );
+
+        project.name = name;
+        project.auth = ctx.accounts.user.key();
+        project.goal = goal;
+        project.donated_amount = 0;
+        project.deadline = deadline;
+
         Ok(())
     }
 
-    pub fn withdraw(ctx: Context<Withdraw>, amount: u64) -> Result<()> {
-        let campaign = &mut ctx.accounts.campaign;
-        let user = &mut ctx.accounts.user;
-        if campaign.owner != *user.key {
-            return Err(ErrorCode::InvalidOwner.into());
-        }
-        // Rent balance depends on data size
-        let rent_balance = Rent::get()?.minimum_balance(campaign.to_account_info().data_len());
-        if **campaign.to_account_info().lamports.borrow() - rent_balance < amount {
-            return Err(ErrorCode::InvalidWithdrawAmount.into());
-        }
-        **campaign.to_account_info().try_borrow_mut_lamports()? -= amount;
-        **user.to_account_info().try_borrow_mut_lamports()? += amount;
-        Ok(())
-    } 
-
     pub fn donate(ctx: Context<Donate>, amount: u64) -> Result<()> {
-        let instruction = anchor_lang::solana_program::system_instruction::transfer(
+        require!(amount != 0, ProjectErrors::DonationIsZero);
+
+        let project = &mut ctx.accounts.project;
+
+        let ix = solana_program::system_instruction::transfer(
             &ctx.accounts.user.key(),
-            &ctx.accounts.campaign.key(),
-            amount
+            &project.key(),
+            amount,
         );
-        anchor_lang::solana_program::program::invoke(
-            &instruction,
+
+        let _ = solana_program::program::invoke(
+            &ix,
             &[
                 ctx.accounts.user.to_account_info(),
-                ctx.accounts.campaign.to_account_info(),
-            ]
+                project.to_account_info(),
+            ],
         );
-        let campaign = &mut ctx.accounts.campaign;
-        campaign.amount_donated += amount;
+
+        project.donated_amount += amount;
+        if project.donators.len() == 9 {
+            project.donators.pop();
+            project.donations.pop();
+            project.donators.push(ctx.accounts.user.key());
+            project.donations.push(amount);
+        }
+
+        Ok(())
+    }
+
+    pub fn withdraw(ctx: Context<Withdraw>) -> Result<()> {
+        let project = &mut ctx.accounts.project;
+        let user = &mut ctx.accounts.user;
+
+        require!(
+            project.auth.key() == user.key(),
+            ProjectErrors::UserNotOwner
+        );
+
+        require!(
+            project.goal <= project.donated_amount,
+            ProjectErrors::GoalNotReached
+        );
+
+        require!(
+            project.deadline <= (Clock::get()?.unix_timestamp * 1000).try_into().unwrap(),
+            ProjectErrors::DeadlineNotOver
+        );
+
+        let amount = project.to_account_info().lamports();
+
+        **user.to_account_info().try_borrow_mut_lamports()? += amount;
+        **project.to_account_info().try_borrow_mut_lamports()? = 0;
+
         Ok(())
     }
 }
 
 #[derive(Accounts)]
 pub struct Create<'info> {
-    // init means to create campaign account
-    // bump to use unique address for campaign account
-    #[account(init, payer=user, space=9000, seeds=[b"campaign_demo".as_ref(), user.key().as_ref()], bump)]
-    pub campaign: Account<'info, Campaign>,
-    // mut makes it changeble (mutable)
+    #[account(init, seeds=[b"seed", user.key().as_ref()], bump, payer=user, space=Project::MAX_SIZE)]
+    pub project: Account<'info, Project>,
+
     #[account(mut)]
     pub user: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct Donate<'info> {
+    #[account(mut)]
+    pub project: Account<'info, Project>,
+
+    #[account(mut)]
+    pub user: Signer<'info>,
+
     pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
 pub struct Withdraw<'info> {
     #[account(mut)]
-    pub campaign: Account<'info, Campaign>,
-    // mut makes it changeble (mutable)
-    #[account(mut)]
-    pub user: Signer<'info>,
-}
+    pub project: Account<'info, Project>,
 
-#[derive(Accounts)]
-pub struct Donate<'info> {
-    #[account(mut)]
-    pub campaign: Account<'info, Campaign>,
-    // mut makes it changeble (mutable)
     #[account(mut)]
     pub user: Signer<'info>,
-    pub system_program: Program<'info, System>,
 }
 
 #[account]
-pub struct Campaign {
-    pub owner: Pubkey,
+pub struct Project {
     pub name: String,
-    pub description: String,
-    pub amount_donated: u64,
-    pub target_amount: u64,
+
+    pub goal: u64,
+
+    pub donated_amount: u64,
+
+    pub donators: Vec<Pubkey>,
+
+    pub donations: Vec<u64>,
+
+    pub deadline: u64,
+
+    pub auth: Pubkey,
+}
+
+impl Project {
+    pub const MAX_SIZE: usize = 8 + 8 + 8 + 8 + (10 * 32) + (10 * 8) + 32;
 }
 
 #[error_code]
-pub enum ErrorCode {
-    #[msg("The user is not the owner of the campaign.")]
-    InvalidOwner,
-    #[msg("Insufficient amount to withdraw.")]
-    InvalidWithdrawAmount,
+pub enum ProjectErrors {
+    #[msg("Name should be of 15 characters or less.")]
+    NameTooLong,
+
+    #[msg("Story should be of 15 characters or less.")]
+    StoryTooLong,
+
+    #[msg("Deadline for this should be in future.")]
+    DeadlineInThePast,
+
+    #[msg("Goal amount should be greater than zero.")]
+    GoalIsZero,
+
+    #[msg("Donation amount should be greater than zero.")]
+    DonationIsZero,
+
+    #[msg("Goal for this project has not been reached yet.")]
+    GoalNotReached,
+
+    #[msg("Deadline for this project is not over yet.")]
+    DeadlineNotOver,
+
+    #[msg("You are not the owner of this project.")]
+    UserNotOwner,
 }
